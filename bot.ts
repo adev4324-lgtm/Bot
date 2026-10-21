@@ -153,16 +153,18 @@ client.on('messageDelete', async (delMsg) => {
 
 // ─────────────────────────────────────────────────────────────
 // AI STAFF ACTIONS
-// The AI only picks the action type + details. Targets (users / roles /
-// channels) are resolved by CODE from real mentions or the replied-to
-// message, so the AI can never invent or swap a target.
+// Every message that addresses the bot (mention, reply, or name) from an
+// authorised staff member is read by the AI, which returns a LIST of commands.
+// The AI only picks actions and details. Targets are resolved by CODE from
+// real mentions, the replied-to message, exact names, or the message text,
+// so the AI can never invent an ID.
 // ─────────────────────────────────────────────────────────────
 const MAIN_STAFF_ID = '1521870728079737053'; // pinged (with the server owner) when a bulk action is refused
-const STAFF_ACTION_GATE = /\b(reset|unblock|verification|verify|ban|unban|kick|mute|unmute|timeout|time out|warn|strike|role|colou?r|channel|rename|nickname|nick|create|make|delete|remove|give|assign)\b/i;
+const STAFF_AI_MODEL = process.env.STAFF_AI_MODEL || 'poolside/laguna-s-2.1';
+const STAFF_ROLE_ID = '1555240171564302346';
 const DESTRUCTIVE = '(?:reset|unblock|delete|remove|ban|kick|purge|wipe|nuke|clear|mute|timeout|destroy|kill)';
 const BULK_A = new RegExp(`\\b${DESTRUCTIVE}\\b\\s+(?:\\S+\\s+){0,2}(?:(?:all|every|everyone|everybody|everything|each|entire|whole)\\b|@everyone|@here)`, 'i');
-const BULK_B = /\b(nuke|wipe|purge|mass[\s-]?\w+|bulk)\b/i;
-const CONFIRM_ACTIONS = new Set(['ban', 'unban', 'kick', 'delete_channel', 'delete_role']);
+const BULK_B = /\b(nuke|wipe|mass[\s-]?\w+|bulk)\b/i;
 const DANGEROUS_ROLE_PERMS = [
   PermissionsBitField.Flags.Administrator,
   PermissionsBitField.Flags.ManageGuild,
@@ -175,19 +177,26 @@ const DANGEROUS_ROLE_PERMS = [
   PermissionsBitField.Flags.ManageWebhooks,
   PermissionsBitField.Flags.MentionEveryone
 ];
+const MEMBER_ACTIONS = new Set(['ban', 'unban', 'kick', 'mute', 'unmute', 'warn', 'set_nickname', 'reset_verification', 'give_role', 'remove_role']);
+const NEEDS_MEMBER = new Set(['kick', 'mute', 'unmute', 'warn', 'set_nickname', 'give_role', 'remove_role']);
 const ALLOWED_ACTIONS = new Set([
-  'ban', 'unban', 'kick', 'mute', 'unmute', 'warn', 'set_nickname',
-  'create_role', 'edit_role', 'give_role', 'remove_role', 'delete_role',
-  'create_channel', 'rename_channel', 'delete_channel', 'reset_verification'
+  ...MEMBER_ACTIONS,
+  'create_role', 'edit_role', 'delete_role',
+  'create_channel', 'rename_channel', 'delete_channel', 'move_channel', 'set_topic', 'slowmode',
+  'lock_channel', 'unlock_channel', 'purge', 'rename_server'
 ]);
+const MAX_TIMEOUT_MS = 28 * 86400000; // Discord caps member timeouts at 28 days
+const MAX_TIMER_MS = 2147483647;      // setTimeout ceiling (~24.8 days)
+const MAX_BATCH = 10;                 // commands per message
+const MAX_TARGETS = 5;                // explicit mentions per message
 
 const normName = (s: string) => String(s || '').normalize('NFKD').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
 const lcTrim = (s: string) => String(s || '').trim().toLowerCase();
+const nameTokens = (s: string) => (String(s || '').normalize('NFKD').toLowerCase().match(/[\p{L}\p{N}]+/gu) || []);
 
-// Finds a channel/category by name.
+// Finds a channel/role/category by name.
 //  exact = same text (ignoring case) | loose = same letters+numbers ignoring symbols/emojis/fonts
 //  token = every word/number the staff typed appears in the name (e.g. "chatting" → "≣ CHATTING 3")
-const nameTokens = (s: string) => (String(s || '').normalize('NFKD').toLowerCase().match(/[\p{L}\p{N}]+/gu) || []);
 function findByName(items: any[], name: string): { kind: 'exact' | 'loose' | 'many' | 'none'; item?: any; candidates: any[] } {
   const exact = items.filter(c => lcTrim(c.name) === lcTrim(name));
   if (exact.length === 1) return { kind: 'exact', item: exact[0], candidates: exact };
@@ -201,6 +210,84 @@ function findByName(items: any[], name: string): { kind: 'exact' | 'loose' | 'ma
   if (token.length === 1) return { kind: 'loose', item: token[0], candidates: token };
   if (token.length > 1) return { kind: 'many', candidates: token };
   return { kind: 'none', candidates: [] };
+}
+
+// Last resort: a category whose name appears inside the staff's message text.
+function categoryFromText(text: string, categories: any[]): any | null {
+  const nText = normName(text);
+  let best: any = null;
+  for (const c of categories) {
+    const n = normName(c.name);
+    if (n.length >= 3 && nText.includes(n) && (!best || n.length > normName(best.name).length)) best = c;
+  }
+  return best;
+}
+
+const COLOR_NAMES: Record<string, string> = {
+  black: '#010101', white: '#FFFFFF', red: '#EF4444', green: '#22C55E', blue: '#3B82F6',
+  blurple: '#5865F2', wumpus: '#5865F2', yellow: '#FACC15', orange: '#F97316', purple: '#A855F7',
+  pink: '#EC4899', magenta: '#D946EF', gold: '#EAB308', teal: '#14B8A6', turquoise: '#2DD4BF',
+  cyan: '#06B6D4', aqua: '#00FFFF', lime: '#84CC16', grey: '#6B7280', gray: '#6B7280',
+  silver: '#C0C0C0', navy: '#1E3A8A', maroon: '#7F1D1D', brown: '#78350F'
+};
+function toHex(c: any): string | null {
+  if (c === null || c === undefined || c === '') return null;
+  const s = String(c).trim().toLowerCase().replace(/^#/, '');
+  if (/^[0-9a-f]{6}$/.test(s)) return '#' + s.toUpperCase();
+  return COLOR_NAMES[s] || null;
+}
+const hexInt = (h: string) => parseInt(h.slice(1), 16);
+
+// "10 days", "2h", "30 mins", "1 month", "1w" → milliseconds. null if nothing parsable.
+function parseDurationMs(raw: any): number | null {
+  if (raw === null || raw === undefined) return null;
+  const t = String(raw).toLowerCase();
+  const re = /(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|wks?|w|months?|mos?|mo)\b/g;
+  let total = 0, found = false, m: RegExpExecArray | null;
+  while ((m = re.exec(t))) {
+    found = true;
+    const u = m[2];
+    const unit = u.startsWith('mo') ? 30 * 86400000
+      : u.startsWith('w') ? 7 * 86400000
+      : u.startsWith('d') ? 86400000
+      : u.startsWith('h') ? 3600000
+      : u.startsWith('m') ? 60000
+      : 1000;
+    total += parseFloat(m[1]) * unit;
+  }
+  return found ? Math.round(total) : null;
+}
+
+function fmtStaffDuration(ms: number): string {
+  for (const [v, n] of [[86400000, 'day'], [3600000, 'hour'], [60000, 'minute'], [1000, 'second']] as [number, string][]) {
+    if (ms >= v) {
+      const q = Math.round((ms / v) * 10) / 10;
+      return `${q} ${n}${q === 1 ? '' : 's'}`;
+    }
+  }
+  return `${ms} ms`;
+}
+
+const cleanName = (n: any, text = false) => {
+  let s = String(n || '').replace(/@/g, '').trim();
+  if (text) s = s.toLowerCase().replace(/[\u0000-\u001f#@]/g, '').replace(/\s+/g, '-').replace(/-{2,}/g, '-').replace(/^-+|-+$/g, '');
+  return s.substring(0, 100);
+};
+
+// Temporary bans: Discord has no timed ban, so the bot unbans when the timer fires.
+// Timers live in memory, so a bot restart drops them (noted in the reply).
+const tempUnbans = new Map<string, NodeJS.Timeout>();
+function scheduleUnban(guild: any, userId: string, untilMs: number) {
+  const key = `${guild.id}:${userId}`;
+  const remaining = untilMs - Date.now();
+  clearTimeout(tempUnbans.get(key));
+  const t = setTimeout(() => {
+    if (Date.now() < untilMs) return scheduleUnban(guild, userId, untilMs);
+    tempUnbans.delete(key);
+    guild.members.unban(userId, 'Temporary ban expired (via AI)').catch(() => {});
+  }, Math.min(Math.max(remaining, 0), MAX_TIMER_MS));
+  (t as any).unref?.();
+  tempUnbans.set(key, t);
 }
 
 function isBulkRequest(text: string): boolean {
@@ -217,38 +304,66 @@ async function refuseBulk(message: any, text: string) {
   }).catch(() => {});
 }
 
-async function parseStaffIntent(maskedText: string): Promise<any | null> {
+interface StaffParse { intent?: any; error?: string }
+
+async function parseStaffIntent(maskedText: string, hint: string): Promise<StaffParse> {
   const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) return null;
-  const system = `You convert a Discord staff message into ONE JSON command. Output ONLY raw JSON, no markdown.
-Schema: {"intent":"action"|"none","action":string|null,"reason":string|null,"duration":string|null,"role_name":string|null,"color":string|null,"new_name":string|null,"channel_name":string|null,"category_name":string|null,"multiple_actions":boolean,"bulk":boolean}
-Allowed actions: ban, unban, kick, mute, unmute, warn, set_nickname, create_role, edit_role, give_role, remove_role, delete_role, create_channel, rename_channel, delete_channel, reset_verification (staff wants a user unblocked / allowed to verify again).
+  if (!apiKey) return { error: 'OPENROUTER_API_KEY is not set' };
+  const system = `You convert ONE Discord staff message into a JSON list of server commands. Output ONLY raw JSON, no markdown, no commentary.
+
+Schema:
+{"intent":"action"|"none","bulk":boolean,"actions":[{"action":string,"reason":string|null,"duration":string|null,"role_name":string|null,"channel_name":string|null,"category_name":string|null,"new_name":string|null,"color":string|null,"color2":string|null,"color3":string|null,"topic":string|null,"count":number|null,"slowmode":string|null}]}
+
+Actions (use exactly these names):
+- ban: ban, banish, yeet, permanently ban. "ban for X days" → put X in duration. null duration = permanent.
+- unban: unban, pardon, lift a ban (the user ID is read by code).
+- kick: kick, boot, remove from the server.
+- mute: mute, timeout, time out, silence, shut up, gag, quiet, punish with a timeout. duration copied as written ("10 days", "2h", "30 minutes"). null if not given.
+- unmute: unmute, untimeout, remove timeout, let them talk again.
+- warn: warn, warning, give a warning, strike, caution.
+- set_nickname: change or reset a member's nickname (new_name = nickname, null = reset).
+- reset_verification: let them verify again, unblock from verification, reset verify.
+- give_role / remove_role: give, add, assign, hand out / take, remove a role from a member (role_name).
+- create_role: create or make a role (role_name, color/color2/color3).
+- edit_role: change a role's name, colour or gradient (role_name, new_name, color, color2).
+- delete_role: delete a role itself (role_name).
+- create_channel: create or make a channel (channel_name; category_name if it goes in a category; mention "voice" if it is a voice channel).
+- rename_channel: channel_name = current name, new_name = new name.
+- delete_channel: delete a channel or a category (channel_name).
+- move_channel: move a channel into a category (channel_name, category_name).
+- set_topic: change a channel's topic or description (topic).
+- slowmode: slow mode for a channel (slowmode e.g. "5s", "1m", "off").
+- lock_channel / unlock_channel: stop or allow members to send messages in a channel.
+- purge: delete the last N messages, optionally from one user (count).
+- rename_server: rename the server (new_name).
+
 Rules:
-- [USER], [ROLE], [CHANNEL] are placeholders for mentioned things. Never output IDs or invent targets.
-- intent="none" for casual chat, questions, or anything that is not a server command.
-- mute = timeout. duration like "10m", "1h", "2d" (null if not given).
-- color must be a #RRGGBB hex (convert color names to hex).
-- role_name = the existing/new role's name if given in words. channel_name likewise (the channel being created/renamed/deleted). category_name = the category the channel should be placed in, if the staff named one. new_name = new name / nickname.
-- Copy ALL names exactly as written: keep emojis, symbols, special characters, numbers, spacing and capitalization. Never translate, shorten or 'fix' them.
-- reason = the reason if given, else null.
-- multiple_actions=true if the staff asked for more than one different action.
-- bulk=true if the request affects all/many/everyone/everything (all channels, all roles, all messages, all members, etc).`;
+- [USER], [ROLE], [CHANNEL] are placeholders for mentioned things. Never output IDs. Never invent targets.
+- intent="none" for chat, questions, or anything that is not a server command.
+- "actions" holds EVERY command asked for, in order. Several commands in one message = several items.
+- Understand typos, slang and casual wording. The intent is what matters.
+- Copy ALL names exactly as written: keep emojis, symbols, numbers, spacing and capitalization. Never translate, shorten or "fix" them.
+- Colours: #RRGGBB or a plain colour name ("black", "green", "wumpus"). A gradient "A to B" or "A gradient B" means color=A, color2=B.
+- reason = the reason if given (short), else null.
+- bulk=true only if an action targets everyone, all, or many members, roles, channels or messages (e.g. "ban everyone", "delete all channels").`;
   try {
     const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'poolside/laguna-s-2.1',
+        model: STAFF_AI_MODEL,
         temperature: 0,
-        messages: [{ role: 'system', content: system }, { role: 'user', content: maskedText }]
+        messages: [{ role: 'system', content: system }, { role: 'user', content: `${hint}\nMessage: ${maskedText}` }]
       })
     });
     const data: any = await res.json();
+    if (data?.error) return { error: String(data.error.message || 'AI service error').substring(0, 160) };
     const raw: string = data?.choices?.[0]?.message?.content || '';
     const m = raw.match(/\{[\s\S]*\}/);
-    return m ? JSON.parse(m[0]) : null;
-  } catch (e) {
-    return null;
+    if (!m) return { error: 'the AI returned no command' };
+    return { intent: JSON.parse(m[0]) };
+  } catch (e: any) {
+    return { error: String(e?.message || e).substring(0, 160) };
   }
 }
 
@@ -274,356 +389,432 @@ async function confirmWithStaff(message: any, text: string): Promise<boolean> {
   }
 }
 
+interface StaffCtx {
+  isStaff: (id: string, member: any) => boolean;
+  embedTitle: string;
+  gifUrl: string;
+  dmLogChannelId: string;
+}
+
+interface RunEnv extends StaffCtx {
+  guild: any;
+  message: any;
+  text: string;
+  reason: string;
+  auditReason: string;
+  targetIds: string[];
+  roleIds: string[];
+  channelIds: string[];
+  unbanIds: string[];
+}
+
+// Role lookup: a mention wins, otherwise the name the AI extracted.
+async function resolveRole(env: RunEnv, cmd: any): Promise<any | 'many' | null> {
+  const { guild } = env;
+  if (env.roleIds.length > 1) return 'many';
+  if (env.roleIds.length === 1) {
+    return guild.roles.cache.get(env.roleIds[0]) || (await guild.roles.fetch(env.roleIds[0]).catch(() => null)) || null;
+  }
+  if (!cmd.role_name) return null;
+  await guild.roles.fetch().catch(() => {});
+  const roles = [...guild.roles.cache.values()].filter((r: any) => r.id !== guild.id);
+  const r = findByName(roles, String(cmd.role_name).replace(/^@/, ''));
+  if (r.kind === 'many') return 'many';
+  return r.item || null;
+}
+
+// Channel lookup: a mention wins, then the exact/fuzzy name. Categories are a fallback.
+// fallbackCurrent = use the channel the command was sent in, but only when no channel was named.
+async function resolveChannel(env: RunEnv, cmd: any, opts: { fallbackCurrent?: boolean; allowCategories?: boolean } = {}): Promise<any | 'many' | null> {
+  const { guild } = env;
+  await guild.channels.fetch().catch(() => {});
+  if (env.channelIds.length > 1) return 'many';
+  if (env.channelIds.length === 1) return guild.channels.cache.get(env.channelIds[0]) || null;
+  const name = cmd.channel_name ? String(cmd.channel_name).replace(/^#/, '') : '';
+  if (!name) return opts.fallbackCurrent ? env.message.channel : null;
+  const all = [...guild.channels.cache.values()];
+  const isCat = (c: any) => c.type === ChannelType.GuildCategory;
+  let r = findByName(all.filter(c => !isCat(c)), name);
+  if (r.kind === 'none' && opts.allowCategories !== false) r = findByName(all.filter(isCat), name);
+  if (r.kind === 'many') return 'many';
+  return r.item || null;
+}
+
+// Category lookup: mention → AI name → name in the message text → any category named in the text.
+async function findCategory(env: RunEnv, cmd: any): Promise<{ cat?: any; error?: string }> {
+  const cats = [...env.guild.channels.cache.values()].filter((c: any) => c.type === ChannelType.GuildCategory);
+  const mentioned = env.channelIds.map(id => env.guild.channels.cache.get(id)).find((c: any) => c && c.type === ChannelType.GuildCategory);
+  if (mentioned) return { cat: mentioned };
+  const candidates: string[] = [];
+  if (cmd.category_name) candidates.push(String(cmd.category_name).trim());
+  const m1 = env.text.match(/categor(?:y|ies)\s+(?:named|called|name)?\s*["“'`]?([^"”'`\n]+?)["”'`]?\s*(?:$|[.,!?]|\band\b|\bwith\b|\bpermissions?\b)/i);
+  const m2 = env.text.match(/\b(?:in|under|inside)\s+(?:the\s+)?["“'`]?([^"”'`\n]+?)["”'`]?\s+categor(?:y|ies)\b/i);
+  if (m1?.[1]) candidates.push(m1[1].trim());
+  if (m2?.[1]) candidates.push(m2[1].trim());
+  for (const c of candidates) {
+    if (!c) continue;
+    const r = findByName(cats, c);
+    if (r.kind === 'many') return { error: `More than one category matches **${c}**. Mention the exact one.` };
+    if (r.item) return { cat: r.item };
+  }
+  const scanned = categoryFromText(env.text, cats);
+  if (scanned) return { cat: scanned };
+  if (candidates[0]) return { error: `I can't find a category named **${candidates[0]}**.` };
+  return { error: 'Which category? Give me its name.' };
+}
+
+// Colour set for a role: primary colour, optional gradient colours.
+function roleColorOpts(cmd: any): { color?: number; colors?: any; hex: string[] } {
+  const primary = toHex(cmd.color);
+  const secondary = toHex(cmd.color2);
+  const tertiary = toHex(cmd.color3);
+  if (!primary && !secondary) return { hex: [] };
+  if (secondary) {
+    const p = primary || secondary;
+    return {
+      colors: { primaryColor: hexInt(p), secondaryColor: hexInt(secondary), ...(tertiary ? { tertiaryColor: hexInt(tertiary) } : {}) },
+      hex: [p, secondary, ...(tertiary ? [tertiary] : [])]
+    };
+  }
+  return { color: hexInt(primary!), hex: [primary!] };
+}
+
+async function unbanUsers(env: RunEnv, cmd: any): Promise<string> {
+  if (env.unbanIds.length === 0) return '⚠️ To unban, give me the exact user ID. Skipped.';
+  const out: string[] = [];
+  for (const id of env.unbanIds.slice(0, MAX_TARGETS)) {
+    const key = `${env.guild.id}:${id}`;
+    clearTimeout(tempUnbans.get(key));
+    tempUnbans.delete(key);
+    try {
+      await env.guild.members.unban(id, env.auditReason);
+      out.push(`✅ Unbanned user ID \`${id}\`.`);
+    } catch (e: any) {
+      out.push(`❌ Couldn't unban \`${id}\`: ${e.message}`);
+    }
+  }
+  return out.join('\n');
+}
+
+async function runMemberAction(action: string, cmd: any, id: string, env: RunEnv): Promise<string> {
+  const { guild } = env;
+  const member: any = await guild.members.fetch(id).catch(() => null);
+  if (NEEDS_MEMBER.has(action) && !member) return `⚠️ <@${id}> is not in this server. Skipped.`;
+  if (id === client.user!.id || id === guild.ownerId || env.isStaff(id, member)) {
+    return `🛡️ I won't do that to <@${id}> (owner, bot or staff). Skipped.`;
+  }
+  const label = member ? `${member.user.tag} (\`${id}\`)` : `<@${id}> (\`${id}\`)`;
+  const reason = env.reason;
+  const audit = env.auditReason;
+
+  switch (action) {
+    case 'ban': {
+      if (member && !member.bannable) return `❌ Can't ban ${label}: their role is above or equal to mine.`;
+      await guild.members.ban(id, { reason: audit, deleteMessageSeconds: 0 });
+      const ms = parseDurationMs(cmd.duration);
+      if (ms) {
+        scheduleUnban(guild, id, Date.now() + ms);
+        return `🔨 Banned ${label} for **${fmtStaffDuration(ms)}**. Reason: ${reason}\n↳ Auto-unban timer is in memory, so it is lost if the bot restarts.`;
+      }
+      return `🔨 Banned ${label}. Reason: ${reason}`;
+    }
+    case 'kick': {
+      if (!member.kickable) return `❌ Can't kick ${label}: their role is above or equal to mine.`;
+      await member.kick(audit);
+      return `👢 Kicked ${label}. Reason: ${reason}`;
+    }
+    case 'mute': {
+      if (!member.moderatable) return `❌ Can't mute ${label}: role hierarchy.`;
+      const raw = String(cmd.duration || '');
+      let ms = parseDurationMs(raw);
+      let note = '';
+      if (ms === null) {
+        if (/perm|forever|indefinite/i.test(raw)) ms = MAX_TIMEOUT_MS;
+        else { ms = 3600000; note = ' (no duration given, so 1 hour)'; }
+      }
+      if (ms > MAX_TIMEOUT_MS) { ms = MAX_TIMEOUT_MS; note = ' (Discord caps timeouts at 28 days)'; }
+      if (ms < 1000) ms = 60000;
+      await member.timeout(ms, audit);
+      return `🔇 Muted ${label} for **${fmtStaffDuration(ms)}**${note}. Reason: ${reason}`;
+    }
+    case 'unmute': {
+      if (!member.moderatable) return `❌ Can't change ${label}'s timeout: role hierarchy.`;
+      await member.timeout(null, audit);
+      return `🔊 Unmuted ${label}.`;
+    }
+    case 'warn': {
+      const embed = new EmbedBuilder()
+        .setTitle(env.embedTitle)
+        .setColor(0xF59E0B)
+        .addFields(
+          { name: '👤 Target', value: `<@${member.id}> (${member.user.tag})`, inline: true },
+          { name: '🛡️ Action', value: 'Warn / Strike', inline: true },
+          { name: '👮 Issued By', value: `<@${env.message.author.id}>`, inline: true },
+          { name: '📝 Reason', value: reason, inline: false }
+        )
+        .setImage(env.gifUrl)
+        .setTimestamp();
+      await env.message.channel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
+      try {
+        const logChannel = await client.channels.fetch(env.dmLogChannelId);
+        if (logChannel && logChannel.isTextBased()) {
+          await (logChannel as TextChannel).send({
+            content: `📋 **[STRIKE LOG]** User <@${member.id}> warned by <@${env.message.author.id}> (via AI).\n**Reason:** ${reason}`,
+            embeds: [embed],
+            allowedMentions: { parse: [] }
+          });
+        }
+      } catch (e) {}
+      return `⚠️ Warned ${label}. Reason: ${reason}`;
+    }
+    case 'reset_verification': {
+      await clearVerifyFails(guild.id, id);
+      return `✅ Verification reset for ${label}. They can click Verify again.`;
+    }
+    case 'set_nickname': {
+      if (!member.manageable) return `❌ Can't change ${label}'s nickname: role hierarchy.`;
+      const nick = cmd.new_name ? String(cmd.new_name).replace(/@/g, '').substring(0, 32) : null;
+      await member.setNickname(nick, audit);
+      return nick ? `✏️ Set ${label}'s nickname to **${nick}**.` : `✏️ Reset ${label}'s nickname.`;
+    }
+    case 'give_role':
+    case 'remove_role': {
+      const role = await resolveRole(env, cmd);
+      if (role === 'many') return '⚠️ More than one role matched. Mention exactly one role. Skipped.';
+      if (!role) return '⚠️ Which role? Name it or mention it. Skipped.';
+      if (role.id === guild.id || role.managed || !role.editable) return `❌ Can't manage **${role.name}** (managed or above my role).`;
+      if (DANGEROUS_ROLE_PERMS.some(p => role.permissions.has(p))) return `🛡️ **${role.name}** has powerful permissions, so I won't hand it out or take it away.`;
+      if (action === 'give_role') await member.roles.add(role, audit);
+      else await member.roles.remove(role, audit);
+      return `✅ ${action === 'give_role' ? 'Gave' : 'Removed'} **${role.name}** ${action === 'give_role' ? 'to' : 'from'} ${label}.`;
+    }
+  }
+  return `⚠️ I can't do \`${action}\` on a member.`;
+}
+
+async function runGuildAction(action: string, cmd: any, env: RunEnv): Promise<string> {
+  const { guild, message } = env;
+  const audit = env.auditReason;
+
+  switch (action) {
+    case 'create_role': {
+      const name = cleanName(cmd.role_name || cmd.new_name);
+      if (!name) return '⚠️ What should the role be called? Skipped.';
+      const c = roleColorOpts(cmd);
+      // Roles made by the AI never get any permissions.
+      const role = await guild.roles.create({ name, permissions: [], reason: audit, ...(c.color !== undefined ? { color: c.color } : {}), ...(c.colors ? { colors: c.colors } : {}) });
+      return `✅ Created role **${role.name}**${c.hex.length ? ` with colour \`${c.hex[0]}\`` : ''}${c.colors ? ` and gradient to \`${c.hex[1]}\`` : ''}, no permissions.`;
+    }
+    case 'edit_role': {
+      const role = await resolveRole(env, cmd);
+      if (role === 'many') return '⚠️ More than one role matched. Mention the exact role. Skipped.';
+      if (!role) return '⚠️ Which role? Name it or mention it. Skipped.';
+      if (role.id === guild.id || role.managed || !role.editable) return `❌ Can't edit **${role.name}** (managed or above my role).`;
+      const c = roleColorOpts(cmd);
+      const newName = cmd.new_name ? cleanName(cmd.new_name) : '';
+      if (!c.hex.length && !newName) return '⚠️ Tell me the new colour or name. Skipped.';
+      await role.edit({
+        ...(c.color !== undefined ? { color: c.color } : {}),
+        ...(c.colors ? { colors: c.colors } : {}),
+        ...(newName ? { name: newName } : {}),
+        reason: audit
+      });
+      return `✅ Updated role **${newName || role.name}**${c.hex.length ? ` → colour \`${c.hex[0]}\`` : ''}${c.colors ? ` gradient to \`${c.hex[1]}\`` : ''}.`;
+    }
+    case 'delete_role': {
+      const role = await resolveRole(env, cmd);
+      if (role === 'many') return '⚠️ More than one role matched. Mention exactly one role. Skipped.';
+      if (!role) return '⚠️ Which role? Name it or mention it. Skipped.';
+      if (role.id === guild.id || role.managed || !role.editable) return `❌ Can't delete **${role.name}** (managed or above my role).`;
+      if (role.id === STAFF_ROLE_ID) return '🛡️ That is the staff role. Skipped.';
+      await role.delete(audit);
+      return `🗑️ Deleted role **${role.name}**.`;
+    }
+    case 'create_channel': {
+      const isVoice = /\bvoice\b/i.test(env.text);
+      const name = cleanName(cmd.channel_name || cmd.new_name, !isVoice);
+      if (!name) return '⚠️ What should the channel be called? Skipped.';
+      const wantsCategory = !!cmd.category_name || env.channelIds.some(id => guild.channels.cache.get(id)?.type === ChannelType.GuildCategory) || /\bcategor(?:y|ies)\b/i.test(env.text);
+      let parent: any = null;
+      if (wantsCategory) {
+        const f = await findCategory(env, cmd);
+        if (f.error) return `❌ ${f.error} Nothing was created.`;
+        parent = f.cat;
+      }
+      const ch: any = await guild.channels.create({
+        name,
+        type: isVoice ? ChannelType.GuildVoice : ChannelType.GuildText,
+        ...(parent ? { parent: parent.id } : {}),
+        reason: audit
+      });
+      if (parent) {
+        const fresh: any = await guild.channels.fetch(ch.id).catch(() => null);
+        if (!fresh || fresh.parentId !== parent.id) {
+          await ch.setParent(parent.id, { lockPermissions: false }).catch(() => {});
+          const again: any = await guild.channels.fetch(ch.id).catch(() => null);
+          if (!again || again.parentId !== parent.id) return `⚠️ Created <#${ch.id}> but couldn't confirm it is inside **${parent.name}**. Please check it.`;
+        }
+        return `✅ Created <#${ch.id}> inside **${parent.name}** ✔️ verified.`;
+      }
+      return `✅ Created <#${ch.id}>.`;
+    }
+    case 'rename_channel': {
+      const ch: any = await resolveChannel(env, cmd);
+      if (ch === 'many') return '⚠️ More than one channel matched. Mention exactly one. Skipped.';
+      if (!ch) return '⚠️ Which channel? Mention it or give its exact name. Skipped.';
+      const name = cleanName(cmd.new_name, ch.type === ChannelType.GuildText);
+      if (!name) return '⚠️ What is the new name? Skipped.';
+      const old = ch.name;
+      await ch.setName(name, audit);
+      return `✏️ Renamed \`${old}\` → <#${ch.id}>.`;
+    }
+    case 'delete_channel': {
+      const ch: any = await resolveChannel(env, cmd);
+      if (ch === 'many') return '⚠️ More than one channel matched. Mention exactly one. Skipped.';
+      if (!ch) return '⚠️ Which channel? Mention it or give its exact name. Skipped.';
+      const name = ch.name;
+      await ch.delete(audit);
+      return `🗑️ Deleted ${ch.type === ChannelType.GuildCategory ? 'category' : 'channel'} **${name}**.`;
+    }
+    case 'move_channel': {
+      const ch: any = await resolveChannel(env, cmd, { allowCategories: false });
+      if (ch === 'many') return '⚠️ More than one channel matched. Mention exactly one. Skipped.';
+      if (!ch) return '⚠️ Which channel? Mention it or give its exact name. Skipped.';
+      const f = await findCategory(env, cmd);
+      if (f.error) return `❌ ${f.error} Nothing was moved.`;
+      await ch.setParent(f.cat.id, { lockPermissions: false });
+      return `✅ Moved <#${ch.id}> into **${f.cat.name}**.`;
+    }
+    case 'set_topic': {
+      const ch: any = await resolveChannel(env, cmd, { fallbackCurrent: true, allowCategories: false });
+      if (ch === 'many') return '⚠️ More than one channel matched. Mention exactly one. Skipped.';
+      if (!ch) return '⚠️ Which channel? Skipped.';
+      const topic = String(cmd.topic || '').substring(0, 1024);
+      await ch.setTopic(topic, audit);
+      return `📝 Set the topic of <#${ch.id}>${topic ? ` to: ${topic}` : ' (cleared)'}.`;
+    }
+    case 'slowmode': {
+      const ch: any = await resolveChannel(env, cmd, { fallbackCurrent: true, allowCategories: false });
+      if (ch === 'many') return '⚠️ More than one channel matched. Mention exactly one. Skipped.';
+      if (!ch) return '⚠️ Which channel? Skipped.';
+      const raw = String(cmd.slowmode || cmd.duration || '').toLowerCase();
+      const seconds = /off|none|0|remove|disable/.test(raw) && !/\d+\s*[a-z]/.test(raw) ? 0 : Math.round((parseDurationMs(raw) || 0) / 1000);
+      const capped = Math.min(seconds, 21600);
+      await ch.setRateLimitPerUser(capped, audit);
+      return capped ? `🐢 Slowmode in <#${ch.id}> set to **${fmtStaffDuration(capped * 1000)}**${seconds > capped ? ' (Discord max is 6 hours)' : ''}.` : `🐢 Slowmode turned off in <#${ch.id}>.`;
+    }
+    case 'lock_channel':
+    case 'unlock_channel': {
+      const ch: any = await resolveChannel(env, cmd, { fallbackCurrent: true, allowCategories: false });
+      if (ch === 'many') return '⚠️ More than one channel matched. Mention exactly one. Skipped.';
+      if (!ch) return '⚠️ Which channel? Skipped.';
+      const lock = action === 'lock_channel';
+      await ch.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: lock ? false : null }, { reason: audit });
+      return lock ? `🔒 Locked <#${ch.id}>. Members can't send messages.` : `🔓 Unlocked <#${ch.id}>.`;
+    }
+    case 'purge': {
+      const ch: any = await resolveChannel(env, cmd, { fallbackCurrent: true, allowCategories: false });
+      if (ch === 'many') return '⚠️ More than one channel matched. Mention exactly one. Skipped.';
+      if (!ch) return '⚠️ Which channel? Skipped.';
+      const count = Math.min(Math.max(parseInt(String(cmd.count || 0), 10) || 0, 0), 100);
+      if (!count) return '⚠️ How many messages? Give a number (max 100). Skipped.';
+      const fetched = await ch.messages.fetch({ limit: 100 });
+      const onlyUsers = env.targetIds;
+      const list = [...fetched.values()].filter((m: any) => !onlyUsers.length || onlyUsers.includes(m.author.id)).slice(0, count);
+      const deleted = await ch.bulkDelete(list, true);
+      return `🧹 Deleted ${deleted.size} message(s) in <#${ch.id}>${onlyUsers.length ? ' from the mentioned user(s)' : ''}. Messages older than 14 days can't be bulk deleted.`;
+    }
+    case 'rename_server': {
+      const name = cleanName(cmd.new_name).substring(0, 100);
+      if (!name) return '⚠️ What should the server be called? Skipped.';
+      await guild.setName(name, audit);
+      return `✏️ Renamed the server to **${name}**.`;
+    }
+  }
+  return `⚠️ I can't do \`${action}\`. Skipped.`;
+}
+
 // Returns true if the message was handled (so normal AI chat is skipped).
-async function handleStaffAiAction(
-  message: any,
-  ctx: { isStaff: (id: string, member: any) => boolean; embedTitle: string; gifUrl: string; dmLogChannelId: string }
-): Promise<boolean> {
+async function handleStaffAiAction(message: any, ctx: StaffCtx): Promise<boolean> {
   const guild = message.guild;
   const text: string = message.content;
-  const reply = (content: string) => message.reply({ content, allowedMentions: { parse: [] } }).catch(() => {});
+  const reply = (content: string) => message.reply({ content: content.substring(0, 1900), allowedMentions: { parse: [] } }).catch(() => {});
 
-  // Layer 1: bulk wording is refused before the AI is even asked.
+  // Bulk wording (everyone / all / nuke / mass) is refused before the AI is asked.
   if (isBulkRequest(text)) { await refuseBulk(message, text); return true; }
 
-  // Resolve exact targets from real mentions (never from the AI).
+  // Targets come from real mentions or the replied-to user, never from the AI.
   const botId = client.user!.id;
-  const userIds = [...new Set([...text.matchAll(/<@!?(\d+)>/g)].map(m => m[1]))].filter(id => id !== botId && id !== message.author.id);
+  const userIds = [...new Set([...text.matchAll(/<@!?(\d+)>/g)].map(m => m[1]))].filter(id => id !== botId);
   const roleIds = [...new Set([...text.matchAll(/<@&(\d+)>/g)].map(m => m[1]))];
   const channelIds = [...new Set([...text.matchAll(/<#(\d+)>/g)].map(m => m[1]))];
 
-  let repliedAuthorId: string | null = null;
-  if (userIds.length === 0 && message.reference?.messageId) {
+  let repliedUserId: string | null = null;
+  if (message.reference?.messageId) {
     try {
       const replied = await message.channel.messages.fetch(message.reference.messageId);
-      if (!replied.author.bot) repliedAuthorId = replied.author.id;
+      if (!replied.author.bot) repliedUserId = replied.author.id;
     } catch (e) {}
   }
-  const targetIds = userIds.length > 0 ? userIds : (repliedAuthorId ? [repliedAuthorId] : []);
+  const targetIds = userIds.length > 0 ? userIds : (repliedUserId ? [repliedUserId] : []);
+  const unbanIds = (text.replace(/<[@#&!]*\d+>/g, '').match(/\b\d{17,20}\b/g) || []);
 
   const masked = text
     .replace(/<@!?\d+>/g, '[USER]')
     .replace(/<@&\d+>/g, '[ROLE]')
     .replace(/<#\d+>/g, '[CHANNEL]')
     .trim();
-  const intent = await parseStaffIntent(masked);
-  if (!intent || intent.intent !== 'action' || !intent.action) return false; // normal chat
+  const hint = `Context: ${userIds.length} user mention(s)` +
+    (userIds.length === 0 && repliedUserId ? ' (none mentioned, but the staff replied to a user, so "him", "her", "this user" means that user)' : '') +
+    `, ${roleIds.length} role mention(s), ${channelIds.length} channel mention(s).`;
 
-  const action = String(intent.action);
-  if (!ALLOWED_ACTIONS.has(action)) {
-    await reply(`⚠️ I can't do \`${action.substring(0, 40)}\`. Nothing was changed.`);
+  const parsed = await parseStaffIntent(masked, hint);
+  if (parsed.error) {
+    console.warn('Staff AI error:', parsed.error);
+    await reply(`⚠️ I couldn't process that (${parsed.error}). Nothing was changed.`);
     return true;
   }
+  const intent = parsed.intent;
+  if (!intent || intent.intent !== 'action' || !Array.isArray(intent.actions) || intent.actions.length === 0) return false; // normal chat
 
-  // Layer 2: the AI's own bulk / multi-action flags.
   if (intent.bulk === true) { await refuseBulk(message, text); return true; }
-  if (intent.multiple_actions === true) {
-    await reply('⚠️ One action at a time please. Nothing was changed.');
-    return true;
-  }
 
-  const reason = String(intent.reason || 'No reason provided').substring(0, 400);
-  const auditReason = `${message.author.tag} (via AI): ${reason}`.substring(0, 480);
+  const reason = String(intent.actions.find((a: any) => a?.reason)?.reason || 'No reason provided').substring(0, 400);
+  const env: RunEnv = {
+    ...ctx,
+    guild,
+    message,
+    text,
+    reason,
+    auditReason: `${message.author.tag} (via AI): ${reason}`.substring(0, 480),
+    targetIds: targetIds.slice(0, MAX_TARGETS),
+    roleIds,
+    channelIds,
+    unbanIds
+  };
 
-  // ── Member actions ──
-  const memberActions = new Set(['reset_verification', 'ban', 'unban', 'kick', 'mute', 'unmute', 'warn', 'set_nickname', 'give_role', 'remove_role']);
-  let target: any = null;
-
-  if (memberActions.has(action)) {
-    // Layer 3: more than one target = bulk.
-    if (targetIds.length > 1) { await refuseBulk(message, text); return true; }
-
-    if (action === 'unban') {
-      const idMatch = text.match(/\b(\d{17,20})\b/);
-      if (!idMatch) { await reply('⚠️ To unban, give me the exact user ID. Nothing was changed.'); return true; }
-      const id = idMatch[1];
-      const ok = await confirmWithStaff(message, `⚠️ Unban user ID \`${id}\`?\nReason: ${reason}`);
-      if (!ok) return true;
-      try {
-        await guild.members.unban(id, auditReason);
-        await reply(`✅ Unbanned user ID \`${id}\`.`);
-      } catch (e: any) { await reply(`❌ Couldn't unban: ${e.message}`); }
-      return true;
-    }
-
-    if (targetIds.length === 0) {
-      await reply('⚠️ Who? Mention the user (or reply to their message and mention me). Nothing was changed.');
-      return true;
-    }
-    const targetId = targetIds[0];
-
-    // ban works even if they left; everything else needs them in the server
-    try { target = await guild.members.fetch(targetId); } catch (e) { target = null; }
-    if (!target && action !== 'ban' && action !== 'reset_verification') { await reply('⚠️ That user is not in this server. Nothing was changed.'); return true; }
-
-    // Safety: never touch the bot, the owner, staff or yourself.
-    if (targetId === botId || targetId === guild.ownerId || ctx.isStaff(targetId, target)) {
-      await reply('🛡️ I won\'t do that to the owner, the bot, or staff. Nothing was changed.');
-      return true;
+  const lines: string[] = [];
+  for (const cmd of intent.actions.slice(0, MAX_BATCH)) {
+    const action = String(cmd?.action || '').trim();
+    if (!ALLOWED_ACTIONS.has(action)) { lines.push(`⚠️ I can't do \`${action.substring(0, 40)}\`. Skipped.`); continue; }
+    const cmdReason = cmd.reason ? String(cmd.reason).substring(0, 400) : reason;
+    const cmdEnv: RunEnv = { ...env, reason: cmdReason, auditReason: `${message.author.tag} (via AI): ${cmdReason}`.substring(0, 480) };
+    try {
+      if (action === 'unban') {
+        lines.push(await unbanUsers(cmdEnv, cmd));
+      } else if (MEMBER_ACTIONS.has(action)) {
+        if (targetIds.length === 0) { lines.push(`⚠️ **${action}**: who? Mention the user or reply to their message. Skipped.`); continue; }
+        for (const id of cmdEnv.targetIds) lines.push(await runMemberAction(action, cmd, id, cmdEnv));
+      } else {
+        lines.push(await runGuildAction(action, cmd, cmdEnv));
+      }
+    } catch (err: any) {
+      lines.push(`❌ **${action}** failed: ${err.message}`);
     }
   }
-
-  const label = target ? `${target.user.tag} (\`${target.id}\`)` : `ID \`${targetIds[0]}\``;
-
-  if (CONFIRM_ACTIONS.has(action) && action !== 'unban' && action !== 'delete_channel' && action !== 'delete_role') {
-    const ok = await confirmWithStaff(message, `⚠️ **${action.toUpperCase()}** → ${label}\nReason: ${reason}\n\nThis is the exact user. Confirm?`);
-    if (!ok) return true;
-  }
-
-  try {
-    switch (action) {
-      case 'ban': {
-        if (target && !target.bannable) { await reply('❌ I can\'t ban them (their role is above mine or equal). Nothing was changed.'); return true; }
-        // deleteMessageSeconds: 0 → banning never wipes their message history
-        await guild.members.ban(targetIds[0], { reason: auditReason, deleteMessageSeconds: 0 });
-        await reply(`🔨 Banned ${label}.\nReason: ${reason}`);
-        return true;
-      }
-      case 'kick': {
-        if (!target.kickable) { await reply('❌ I can\'t kick them (their role is above mine or equal). Nothing was changed.'); return true; }
-        await target.kick(auditReason);
-        await reply(`👢 Kicked ${label}.\nReason: ${reason}`);
-        return true;
-      }
-      case 'mute': {
-        if (!target.moderatable) { await reply('❌ I can\'t mute them (role hierarchy). Nothing was changed.'); return true; }
-        let duration = String(intent.duration || '1h');
-        let m = duration.match(/^(\d+)([smhd])$/i);
-        if (!m) { duration = '1h'; m = duration.match(/^(\d+)([smhd])$/i); }
-        const v = parseInt(m![1], 10);
-        const unit = m![2].toLowerCase();
-        let ms = unit === 's' ? v * 1000 : unit === 'm' ? v * 60000 : unit === 'h' ? v * 3600000 : v * 86400000;
-        const max = 28 * 86400000;
-        if (ms > max) { ms = max; duration = '28d'; }
-        if (ms < 1000) { ms = 60000; duration = '1m'; }
-        await target.timeout(ms, auditReason);
-        await reply(`🔇 Muted ${label} for **${duration}**.\nReason: ${reason}`);
-        return true;
-      }
-      case 'unmute': {
-        if (!target.moderatable) { await reply('❌ I can\'t change their timeout (role hierarchy). Nothing was changed.'); return true; }
-        await target.timeout(null, auditReason);
-        await reply(`🔊 Unmuted ${label}.`);
-        return true;
-      }
-      case 'warn': {
-        const embed = new EmbedBuilder()
-          .setTitle(ctx.embedTitle)
-          .setColor(0xF59E0B)
-          .addFields(
-            { name: '👤 Target', value: `<@${target.id}> (${target.user.tag})`, inline: true },
-            { name: '🛡️ Action', value: 'Warn / Strike', inline: true },
-            { name: '👮 Issued By', value: `<@${message.author.id}>`, inline: true },
-            { name: '📝 Reason', value: reason, inline: false }
-          )
-          .setImage(ctx.gifUrl)
-          .setTimestamp();
-        await message.reply({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
-        try {
-          const logChannel = await client.channels.fetch(ctx.dmLogChannelId);
-          if (logChannel && logChannel.isTextBased()) {
-            await (logChannel as TextChannel).send({
-              content: `📋 **[STRIKE LOG]** User <@${target.id}> warned by <@${message.author.id}> (via AI).\n**Reason:** ${reason}`,
-              embeds: [embed],
-              allowedMentions: { parse: [] }
-            });
-          }
-        } catch (e) {}
-        return true;
-      }
-      case 'reset_verification': {
-        await clearVerifyFails(guild.id, targetIds[0]);
-        await reply(`✅ Verification reset for ${label}. They can click Verify again.`);
-        return true;
-      }
-      case 'set_nickname': {
-        if (!target.manageable) { await reply('❌ I can\'t change their nickname (role hierarchy). Nothing was changed.'); return true; }
-        const nick = intent.new_name ? String(intent.new_name).replace(/@/g, '').substring(0, 32) : null;
-        await target.setNickname(nick, auditReason);
-        await reply(nick ? `✏️ Set ${label}'s nickname to **${nick}**.` : `✏️ Reset ${label}'s nickname.`);
-        return true;
-      }
-    }
-
-    // ── Role / channel actions ──
-    const resolveRole = async (): Promise<any | null> => {
-      if (roleIds.length > 1 && action !== 'give_role') return 'many';
-      if (roleIds.length > 1) return 'many';
-      if (roleIds.length === 1) return guild.roles.cache.get(roleIds[0]) || (await guild.roles.fetch(roleIds[0]).catch(() => null));
-      if (intent.role_name) {
-        const nm = String(intent.role_name).toLowerCase();
-        const found = guild.roles.cache.filter((r: any) => r.name.toLowerCase() === nm && r.id !== guild.id);
-        if (found.size === 1) return found.first();
-        if (found.size > 1) return 'many';
-      }
-      return null;
-    };
-    const resolveChannel = async (): Promise<any | null> => {
-      await guild.channels.fetch().catch(() => {});
-      if (channelIds.length > 1) return 'many';
-      if (channelIds.length === 1) return guild.channels.cache.get(channelIds[0]) || (await guild.channels.fetch(channelIds[0]).catch(() => null));
-      if (intent.channel_name) {
-        const nonCats = [...guild.channels.cache.values()].filter((c: any) => c.type !== ChannelType.GuildCategory);
-        const r = findByName(nonCats, String(intent.channel_name).replace(/^#/, ''));
-        if (r.kind === 'many') return 'many';
-        if (r.item) return r.item;
-      }
-      return null;
-    };
-    const cleanName = (n: string, channel = false) => {
-      let s = String(n || '').replace(/@/g, '').trim();
-      if (channel) s = s.toLowerCase().replace(/[\u0000-\u001f#@]/g, '').replace(/\s+/g, '-').replace(/-{2,}/g, '-').replace(/^-+|-+$/g, '');
-      return s.substring(0, 100);
-    };
-    const validColor = (c: any) => (typeof c === 'string' && /^#[0-9a-f]{6}$/i.test(c.trim())) ? c.trim() : null;
-
-    switch (action) {
-      case 'create_role': {
-        const name = cleanName(intent.role_name || intent.new_name);
-        if (!name) { await reply('⚠️ What should the role be called? Nothing was changed.'); return true; }
-        const color = validColor(intent.color);
-        // Roles made by the AI never get any permissions.
-        const role = await guild.roles.create({ name, color: color || undefined, permissions: [], reason: auditReason });
-        await reply(`✅ Created role **${role.name}**${color ? ` with color \`${color}\`` : ''} (no permissions).`);
-        return true;
-      }
-      case 'edit_role': {
-        const role = await resolveRole();
-        if (role === 'many') { await reply('⚠️ More than one role matched. Mention the exact role. Nothing was changed.'); return true; }
-        if (!role) { await reply('⚠️ Which role? Mention it. Nothing was changed.'); return true; }
-        if (role.id === guild.id || role.managed || !role.editable) { await reply('❌ I can\'t edit that role. Nothing was changed.'); return true; }
-        const color = validColor(intent.color);
-        const newName = intent.new_name ? cleanName(intent.new_name) : null;
-        if (!color && !newName) { await reply('⚠️ Tell me the new color or name. Nothing was changed.'); return true; }
-        await role.edit({ ...(color ? { color } : {}), ...(newName ? { name: newName } : {}), reason: auditReason });
-        await reply(`✅ Updated role **${role.name}**${color ? ` → color \`${color}\`` : ''}${newName ? ` → name **${newName}**` : ''}.`);
-        return true;
-      }
-      case 'give_role':
-      case 'remove_role': {
-        const role = await resolveRole();
-        if (role === 'many') { await reply('⚠️ More than one role matched. Mention exactly one role. Nothing was changed.'); return true; }
-        if (!role) { await reply('⚠️ Which role? Mention it. Nothing was changed.'); return true; }
-        if (role.id === guild.id || role.managed || !role.editable) { await reply('❌ I can\'t manage that role. Nothing was changed.'); return true; }
-        if (DANGEROUS_ROLE_PERMS.some(p => role.permissions.has(p))) {
-          await reply('🛡️ That role has powerful permissions, so I won\'t hand it out or remove it. Nothing was changed.');
-          return true;
-        }
-        if (action === 'give_role') await target.roles.add(role, auditReason);
-        else await target.roles.remove(role, auditReason);
-        await reply(`✅ ${action === 'give_role' ? 'Gave' : 'Removed'} **${role.name}** ${action === 'give_role' ? 'to' : 'from'} ${label}.`);
-        return true;
-      }
-      case 'delete_role': {
-        const role = await resolveRole();
-        if (role === 'many') { await reply('⚠️ More than one role matched. Mention exactly one role. Nothing was changed.'); return true; }
-        if (!role) { await reply('⚠️ Which role? Mention it. Nothing was changed.'); return true; }
-        if (role.id === guild.id || role.managed || !role.editable) { await reply('❌ I can\'t delete that role. Nothing was changed.'); return true; }
-        if (ctx.isStaff('', { roles: { cache: { has: (id: string) => id === role.id } } })) {
-          await reply('🛡️ That is the staff role. Nothing was changed.');
-          return true;
-        }
-        const ok = await confirmWithStaff(message, `⚠️ **DELETE ROLE** → **${role.name}** (\`${role.id}\`)\nThis is the exact role. Confirm?`);
-        if (!ok) return true;
-        await role.delete(auditReason);
-        await reply(`🗑️ Deleted role **${role.name}**.`);
-        return true;
-      }
-      case 'create_channel': {
-        await guild.channels.fetch().catch(() => {});
-        const name = cleanName(intent.channel_name || intent.new_name, true);
-        if (!name) { await reply('⚠️ What should the channel be called? Nothing was changed.'); return true; }
-
-        const categories = [...guild.channels.cache.values()].filter((c: any) => c.type === ChannelType.GuildCategory);
-        const mentionedCat = channelIds.map(id => guild.channels.cache.get(id)).find((c: any) => c && c.type === ChannelType.GuildCategory);
-        const wantsCategory = /\bcategor(?:y|ies)\b/i.test(text) || !!intent.category_name || !!mentionedCat;
-
-        let parent: any = null;
-        if (wantsCategory) {
-          let catName: string | null = null;
-          if (!mentionedCat) {
-            const aiCat = intent.category_name ? String(intent.category_name).trim() : '';
-            // trust the AI's category only if it really appears in the staff's message
-            if (aiCat && text.toLowerCase().includes(aiCat.toLowerCase())) catName = aiCat;
-            if (!catName) {
-              const m1 = text.match(/categor(?:y|ies)\s+(?:named|called|name)?\s*["“'`]?([^"”'`\n]+?)["”'`]?\s*(?:$|[.,!?]|\band\b)/i);
-              const m2 = text.match(/\b(?:in|under|inside)\s+(?:the\s+)?["“'`]?([^"”'`\n]+?)["”'`]?\s+categor(?:y|ies)\b/i);
-              catName = (m1?.[1] || m2?.[1] || '').trim() || null;
-            }
-          }
-          if (mentionedCat) {
-            parent = mentionedCat;
-          } else if (!catName) {
-            await reply('⚠️ Which category? Give me its name. Nothing was created.');
-            return true;
-          } else {
-            const r = findByName(categories, catName);
-            if (r.kind === 'many') {
-              const list = r.candidates.slice(0, 8).map((c: any) => `• ${c.name} (\`${c.id}\`)`).join('\n');
-              await reply(`⚠️ More than one category matches **${catName}**:\n${list}\nMention the exact one. Nothing was created.`);
-              return true;
-            }
-            if (r.kind === 'none') {
-              const list = categories.slice(0, 15).map((c: any) => `• ${c.name}`).join('\n') || '(no categories)';
-              await reply(`❌ I can't find a category named **${catName}**, so I did **not** create the channel.\nCategories I can see:\n${list}`);
-              return true;
-            }
-            parent = r.item;
-          }
-        }
-
-        const isVoice = /\bvoice\b/i.test(text);
-        const ch = await guild.channels.create({
-          name,
-          type: isVoice ? ChannelType.GuildVoice : ChannelType.GuildText,
-          ...(parent ? { parent: parent.id } : {}),
-          reason: auditReason
-        });
-
-        // Verify it really landed in the right category
-        if (parent) {
-          const fresh: any = await guild.channels.fetch(ch.id).catch(() => null);
-          if (!fresh || fresh.parentId !== parent.id) {
-            await ch.setParent(parent.id, { lockPermissions: false }).catch(() => {});
-            const again: any = await guild.channels.fetch(ch.id).catch(() => null);
-            if (!again || again.parentId !== parent.id) {
-              await reply(`⚠️ I created <#${ch.id}> but couldn't confirm it is inside **${parent.name}**. Please check it.`);
-              return true;
-            }
-          }
-          await reply(`✅ Created <#${ch.id}> inside category **${parent.name}** (\`${parent.id}\`) ✔️ verified.`);
-        } else {
-          await reply(`✅ Created channel <#${ch.id}>.`);
-        }
-        return true;
-      }
-      case 'rename_channel': {
-        const ch = await resolveChannel();
-        if (ch === 'many') { await reply('⚠️ More than one channel matched. Mention exactly one. Nothing was changed.'); return true; }
-        if (!ch) { await reply('⚠️ Which channel? Mention it. Nothing was changed.'); return true; }
-        const name = cleanName(intent.new_name, true);
-        if (!name) { await reply('⚠️ What\'s the new name? Nothing was changed.'); return true; }
-        const old = ch.name;
-        await ch.setName(name, auditReason);
-        await reply(`✏️ Renamed \`#${old}\` → <#${ch.id}>.`);
-        return true;
-      }
-      case 'delete_channel': {
-        const ch = await resolveChannel();
-        if (ch === 'many') { await reply('⚠️ More than one channel matched. Mention exactly one. Nothing was changed.'); return true; }
-        if (!ch) { await reply('⚠️ Which channel? Mention it. Nothing was changed.'); return true; }
-        const ok = await confirmWithStaff(message, `⚠️ **DELETE CHANNEL** → #${ch.name} (\`${ch.id}\`)\nThis is the exact channel. Confirm?`);
-        if (!ok) return true;
-        await ch.delete(auditReason);
-        if (ch.id !== message.channel.id) await reply(`🗑️ Deleted channel #${ch.name}.`);
-        return true;
-      }
-    }
-  } catch (err: any) {
-    await reply(`❌ That failed: ${err.message}. Nothing else was changed.`);
-    return true;
-  }
-  return false;
+  if (intent.actions.length > MAX_BATCH) lines.push(`⚠️ Only the first ${MAX_BATCH} commands were run.`);
+  await reply(lines.join('\n') || 'Nothing to do.');
+  return true;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -2484,7 +2675,7 @@ client.on('messageCreate', async (message) => {
   const autoChat = false; // the AI never jumps into conversations on its own
 
   if (!isCommand && (addressed || autoChat)) {
-    if (addressed && isAuthorized && STAFF_ACTION_GATE.test(message.content)) {
+    if (addressed && isAuthorized) { // every addressed staff message is read by the AI
       if (!(await claimOnce(`staff_${message.id}`))) return;
       const handled = await handleStaffAiAction(message, {
         isStaff: (id: string, member: any) => allowedUserIds.includes(id) || !!member?.roles?.cache?.has(allowedRoleId),
