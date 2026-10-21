@@ -177,13 +177,15 @@ const DANGEROUS_ROLE_PERMS = [
   PermissionsBitField.Flags.ManageWebhooks,
   PermissionsBitField.Flags.MentionEveryone
 ];
-const MEMBER_ACTIONS = new Set(['ban', 'unban', 'kick', 'mute', 'unmute', 'warn', 'set_nickname', 'reset_verification', 'give_role', 'remove_role']);
-const NEEDS_MEMBER = new Set(['kick', 'mute', 'unmute', 'warn', 'set_nickname', 'give_role', 'remove_role']);
+const MEMBER_ACTIONS = new Set(['ban', 'unban', 'kick', 'mute', 'unmute', 'warn', 'set_nickname', 'reset_verification', 'give_role', 'remove_role', 'server_mute', 'server_deafen', 'disconnect_voice', 'move_voice', 'dm_user']);
+const NEEDS_MEMBER = new Set(['kick', 'mute', 'unmute', 'warn', 'set_nickname', 'give_role', 'remove_role', 'server_mute', 'server_deafen', 'disconnect_voice', 'move_voice', 'dm_user']);
 const ALLOWED_ACTIONS = new Set([
   ...MEMBER_ACTIONS,
   'create_role', 'edit_role', 'delete_role',
   'create_channel', 'rename_channel', 'delete_channel', 'move_channel', 'set_topic', 'slowmode',
-  'lock_channel', 'unlock_channel', 'purge', 'rename_server'
+  'lock_channel', 'unlock_channel', 'purge', 'rename_server',
+  'create_category', 'send_message', 'delete_message', 'pin_message', 'unpin_message', 'add_reaction',
+  'create_thread', 'create_invite', 'set_permissions', 'set_role_permissions'
 ]);
 const MAX_TIMEOUT_MS = 28 * 86400000; // Discord caps member timeouts at 28 days
 const MAX_TIMER_MS = 2147483647;      // setTimeout ceiling (~24.8 days)
@@ -312,7 +314,7 @@ async function parseStaffIntent(maskedText: string, hint: string): Promise<Staff
   const system = `You convert ONE Discord staff message into a JSON list of server commands. Output ONLY raw JSON, no markdown, no commentary.
 
 Schema:
-{"intent":"action"|"none","bulk":boolean,"actions":[{"action":string,"reason":string|null,"duration":string|null,"role_name":string|null,"channel_name":string|null,"category_name":string|null,"new_name":string|null,"color":string|null,"color2":string|null,"color3":string|null,"topic":string|null,"count":number|null,"slowmode":string|null}]}
+{"intent":"action"|"none","bulk":boolean,"actions":[{"action":string,"reason":string|null,"duration":string|null,"role_name":string|null,"channel_name":string|null,"category_name":string|null,"new_name":string|null,"color":string|null,"color2":string|null,"color3":string|null,"topic":string|null,"count":number|null,"slowmode":string|null,"content":string|null,"emoji":string|null,"allow":string[],"deny":string[],"hours":number|null}]}
 
 Actions (use exactly these names):
 - ban: ban, banish, yeet, permanently ban. "ban for X days" → put X in duration. null duration = permanent.
@@ -336,6 +338,19 @@ Actions (use exactly these names):
 - lock_channel / unlock_channel: stop or allow members to send messages in a channel.
 - purge: delete the last N messages, optionally from one user (count).
 - rename_server: rename the server (new_name).
+
+- create_category: create a category (channel_name).
+- send_message: say or send text in a channel (channel_name, or the current channel; content).
+- delete_message / pin_message / unpin_message: act on the message the staff replied to.
+- add_reaction: react to the replied message (emoji).
+- create_thread: start a thread (new_name, channel_name).
+- create_invite: invite link for a channel (channel_name, hours; null = never expires).
+- set_permissions: channel permission overwrite for a role or everyone (channel_name, role_name, allow[], deny[]).
+- set_role_permissions: change a role's server permissions (role_name, allow[], deny[]).
+- server_mute / server_deafen / disconnect_voice: voice actions on a member. move_voice: move a member to a voice channel (channel_name).
+- dm_user: direct message a member (content).
+- create_role may also take allow[] (permission names).
+- Permission names are Discord's: ViewChannel, SendMessages, ManageMessages, Administrator, MentionEveryone, etc.
 
 Rules:
 - [USER], [ROLE], [CHANNEL] are placeholders for mentioned things. Never output IDs. Never invent targets.
@@ -479,6 +494,29 @@ function roleColorOpts(cmd: any): { color?: number; colors?: any; hex: string[] 
   return { color: hexInt(primary!), hex: [primary!] };
 }
 
+// Discord permission names as typed by the owner (case, spaces, _ and - ignored).
+function parseFlags(list: any): { ok: string[]; bad: string[] } {
+  const keys = Object.keys(PermissionsBitField.Flags);
+  const ok: string[] = [], bad: string[] = [];
+  for (const raw of Array.isArray(list) ? list : []) {
+    const n = String(raw).replace(/[\s_-]/g, '').toLowerCase();
+    const hit = keys.find(k => k.toLowerCase() === n);
+    if (hit) ok.push(hit); else bad.push(String(raw));
+  }
+  return { ok, bad };
+}
+
+// The message the owner replied to (for delete / pin / react).
+async function repliedMessage(env: RunEnv): Promise<any | null> {
+  const ref = env.message.reference;
+  if (!ref?.messageId) return null;
+  const ch: any = ref.channelId
+    ? (env.guild.channels.cache.get(ref.channelId) || (await env.guild.channels.fetch(ref.channelId).catch(() => null)))
+    : env.message.channel;
+  if (!ch?.messages) return null;
+  return ch.messages.fetch(ref.messageId).catch(() => null);
+}
+
 async function unbanUsers(env: RunEnv, cmd: any): Promise<string> {
   if (env.unbanIds.length === 0) return '⚠️ To unban, give me the exact user ID. Skipped.';
   const out: string[] = [];
@@ -500,8 +538,8 @@ async function runMemberAction(action: string, cmd: any, id: string, env: RunEnv
   const { guild } = env;
   const member: any = await guild.members.fetch(id).catch(() => null);
   if (NEEDS_MEMBER.has(action) && !member) return `⚠️ <@${id}> is not in this server. Skipped.`;
-  if (id === client.user!.id || id === guild.ownerId || env.isStaff(id, member)) {
-    return `🛡️ I won't do that to <@${id}> (owner, bot or staff). Skipped.`;
+  if (id === client.user!.id || id === guild.ownerId) {
+    return `🛡️ I won't do that to <@${id}> (the bot itself or the server owner). Skipped.`;
   }
   const label = member ? `${member.user.tag} (\`${id}\`)` : `<@${id}> (\`${id}\`)`;
   const reason = env.reason;
@@ -577,13 +615,36 @@ async function runMemberAction(action: string, cmd: any, id: string, env: RunEnv
       await member.setNickname(nick, audit);
       return nick ? `✏️ Set ${label}'s nickname to **${nick}**.` : `✏️ Reset ${label}'s nickname.`;
     }
+    case 'server_mute':
+    case 'server_deafen': {
+      if (!member.voice.channelId) return `⚠️ ${label} isn't in a voice channel. Skipped.`;
+      const mute = action === 'server_mute';
+      if (mute) await member.voice.setMute(true, audit); else await member.voice.setDeaf(true, audit);
+      return `🔇 Server ${mute ? 'muted' : 'deafened'} ${label} in voice.`;
+    }
+    case 'disconnect_voice': {
+      if (!member.voice.channelId) return `⚠️ ${label} isn't in a voice channel. Skipped.`;
+      await member.voice.disconnect(audit);
+      return `📴 Disconnected ${label} from voice.`;
+    }
+    case 'move_voice': {
+      const ch: any = await resolveChannel(env, cmd, { allowCategories: false });
+      if (!ch || ch === 'many') return '⚠️ Which voice channel? Skipped.';
+      await member.voice.setChannel(ch, audit);
+      return `🔀 Moved ${label} to <#${ch.id}>.`;
+    }
+    case 'dm_user': {
+      const text = String(cmd.content || '').substring(0, 2000);
+      if (!text) return '⚠️ What should I say? Skipped.';
+      await member.send(text);
+      return `📨 DM sent to ${label}.`;
+    }
     case 'give_role':
     case 'remove_role': {
       const role = await resolveRole(env, cmd);
       if (role === 'many') return '⚠️ More than one role matched. Mention exactly one role. Skipped.';
       if (!role) return '⚠️ Which role? Name it or mention it. Skipped.';
       if (role.id === guild.id || role.managed || !role.editable) return `❌ Can't manage **${role.name}** (managed or above my role).`;
-      if (DANGEROUS_ROLE_PERMS.some(p => role.permissions.has(p))) return `🛡️ **${role.name}** has powerful permissions, so I won't hand it out or take it away.`;
       if (action === 'give_role') await member.roles.add(role, audit);
       else await member.roles.remove(role, audit);
       return `✅ ${action === 'give_role' ? 'Gave' : 'Removed'} **${role.name}** ${action === 'give_role' ? 'to' : 'from'} ${label}.`;
@@ -602,8 +663,9 @@ async function runGuildAction(action: string, cmd: any, env: RunEnv): Promise<st
       if (!name) return '⚠️ What should the role be called? Skipped.';
       const c = roleColorOpts(cmd);
       // Roles made by the AI never get any permissions.
-      const role = await guild.roles.create({ name, permissions: [], reason: audit, ...(c.color !== undefined ? { color: c.color } : {}), ...(c.colors ? { colors: c.colors } : {}) });
-      return `✅ Created role **${role.name}**${c.hex.length ? ` with colour \`${c.hex[0]}\`` : ''}${c.colors ? ` and gradient to \`${c.hex[1]}\`` : ''}, no permissions.`;
+      const perms = parseFlags(cmd.allow).ok;
+      const role = await guild.roles.create({ name, permissions: perms, reason: audit, ...(c.color !== undefined ? { color: c.color } : {}), ...(c.colors ? { colors: c.colors } : {}) });
+      return `✅ Created role **${role.name}**${c.hex.length ? ` with colour \`${c.hex[0]}\`` : ''}${c.colors ? ` and gradient to \`${c.hex[1]}\`` : ''}${perms.length ? ` with ${perms.length} permission(s)` : ', no permissions'}.`;
     }
     case 'edit_role': {
       const role = await resolveRole(env, cmd);
@@ -626,7 +688,6 @@ async function runGuildAction(action: string, cmd: any, env: RunEnv): Promise<st
       if (role === 'many') return '⚠️ More than one role matched. Mention exactly one role. Skipped.';
       if (!role) return '⚠️ Which role? Name it or mention it. Skipped.';
       if (role.id === guild.id || role.managed || !role.editable) return `❌ Can't delete **${role.name}** (managed or above my role).`;
-      if (role.id === STAFF_ROLE_ID) return '🛡️ That is the staff role. Skipped.';
       await role.delete(audit);
       return `🗑️ Deleted role **${role.name}**.`;
     }
@@ -724,6 +785,73 @@ async function runGuildAction(action: string, cmd: any, env: RunEnv): Promise<st
       const deleted = await ch.bulkDelete(list, true);
       return `🧹 Deleted ${deleted.size} message(s) in <#${ch.id}>${onlyUsers.length ? ' from the mentioned user(s)' : ''}. Messages older than 14 days can't be bulk deleted.`;
     }
+    case 'create_category': {
+      const name = cleanName(cmd.channel_name || cmd.new_name || cmd.category_name);
+      if (!name) return '⚠️ What should the category be called? Skipped.';
+      const cat: any = await guild.channels.create({ name, type: ChannelType.GuildCategory, reason: audit });
+      return `✅ Created category **${cat.name}**.`;
+    }
+    case 'send_message': {
+      const ch: any = await resolveChannel(env, cmd, { fallbackCurrent: true, allowCategories: false });
+      if (!ch || ch === 'many') return '⚠️ Which channel? Skipped.';
+      const content = String(cmd.content || '').substring(0, 2000);
+      if (!content) return '⚠️ What should I say? Skipped.';
+      await ch.send({ content });
+      return `💬 Sent the message in <#${ch.id}>.`;
+    }
+    case 'delete_message':
+    case 'pin_message':
+    case 'unpin_message':
+    case 'add_reaction': {
+      const m: any = await repliedMessage(env);
+      if (!m) return '⚠️ Reply to the message first. Skipped.';
+      if (action === 'delete_message') { await m.delete(); return '🗑️ Deleted that message.'; }
+      if (action === 'pin_message') { await m.pin(audit); return '📌 Pinned that message.'; }
+      if (action === 'unpin_message') { await m.unpin(audit); return '📌 Unpinned that message.'; }
+      const emoji = String(cmd.emoji || '').trim();
+      if (!emoji) return '⚠️ Which emoji? Skipped.';
+      await m.react(emoji);
+      return `➕ Reacted with ${emoji}.`;
+    }
+    case 'create_thread': {
+      const ch: any = await resolveChannel(env, cmd, { fallbackCurrent: true, allowCategories: false });
+      if (!ch || ch === 'many' || !ch.threads) return '⚠️ Which text channel? Skipped.';
+      const name = String(cmd.new_name || cmd.channel_name || 'new thread').replace(/@/g, '').substring(0, 100);
+      const thread: any = await ch.threads.create({ name, reason: audit });
+      return `🧵 Created thread <#${thread.id}>.`;
+    }
+    case 'create_invite': {
+      const ch: any = await resolveChannel(env, cmd, { fallbackCurrent: true, allowCategories: false });
+      if (!ch || ch === 'many' || !ch.createInvite) return '⚠️ Which channel? Skipped.';
+      const hours = Number(cmd.hours) || 0;
+      const maxAge = hours > 0 ? Math.min(Math.round(hours * 3600), 604800) : 0;
+      const inv: any = await ch.createInvite({ maxAge, reason: audit });
+      return `🔗 Invite for <#${ch.id}>: https://discord.gg/${inv.code} (${maxAge ? `expires in ${fmtStaffDuration(maxAge * 1000)}` : 'never expires'}).`;
+    }
+    case 'set_permissions': {
+      const ch: any = await resolveChannel(env, cmd, { fallbackCurrent: true, allowCategories: true });
+      if (!ch || ch === 'many') return '⚠️ Which channel? Skipped.';
+      let target: any = guild.roles.everyone;
+      if (cmd.role_name && !/^@?everyone$/i.test(String(cmd.role_name))) target = await resolveRole(env, cmd);
+      if (!target || target === 'many') return '⚠️ Which role? Skipped.';
+      const allow = parseFlags(cmd.allow), deny = parseFlags(cmd.deny);
+      const obj: any = {};
+      for (const k of allow.ok) obj[k] = true;
+      for (const k of deny.ok) obj[k] = false;
+      if (!Object.keys(obj).length) return '⚠️ Which permissions? Skipped.';
+      await ch.permissionOverwrites.edit(target, obj, { reason: audit });
+      const unknown = [...allow.bad, ...deny.bad];
+      return `🛡️ Set permissions for **${target.name}** in <#${ch.id}>: allow ${allow.ok.join(', ') || 'none'}, deny ${deny.ok.join(', ') || 'none'}.${unknown.length ? ` Unknown names skipped: ${unknown.join(', ')}.` : ''}`;
+    }
+    case 'set_role_permissions': {
+      const role: any = await resolveRole(env, cmd);
+      if (!role || role === 'many') return '⚠️ Which role? Skipped.';
+      const allow = parseFlags(cmd.allow), deny = parseFlags(cmd.deny);
+      if (!allow.ok.length && !deny.ok.length) return '⚠️ Which permissions? Skipped.';
+      await role.setPermissions(role.permissions.add(allow.ok).remove(deny.ok), audit);
+      const unknown = [...allow.bad, ...deny.bad];
+      return `🛡️ Updated **${role.name}** permissions: +${allow.ok.join(', ') || 'none'} / -${deny.ok.join(', ') || 'none'}.${unknown.length ? ` Unknown names skipped: ${unknown.join(', ')}.` : ''}`;
+    }
     case 'rename_server': {
       const name = cleanName(cmd.new_name).substring(0, 100);
       if (!name) return '⚠️ What should the server be called? Skipped.';
@@ -740,8 +868,9 @@ async function handleStaffAiAction(message: any, ctx: StaffCtx): Promise<boolean
   const text: string = message.content;
   const reply = (content: string) => message.reply({ content: content.substring(0, 1900), allowedMentions: { parse: [] } }).catch(() => {});
 
-  // Bulk wording (everyone / all / nuke / mass) is refused before the AI is asked.
-  if (isBulkRequest(text)) { await refuseBulk(message, text); return true; }
+  // Only the server owner gets to command the bot. Everyone else gets a refusal.
+  const isOwner = message.author.id === guild.ownerId;
+  if (!isOwner && isBulkRequest(text)) { await refuseBulk(message, text); return true; }
 
   // Targets come from real mentions or the replied-to user, never from the AI.
   const botId = client.user!.id;
@@ -777,7 +906,8 @@ async function handleStaffAiAction(message: any, ctx: StaffCtx): Promise<boolean
   const intent = parsed.intent;
   if (!intent || intent.intent !== 'action' || !Array.isArray(intent.actions) || intent.actions.length === 0) return false; // normal chat
 
-  if (intent.bulk === true) { await refuseBulk(message, text); return true; }
+  if (!isOwner) { await reply('🔒 Only the server owner can give me commands. Nothing was changed.'); return true; }
+  if (intent.bulk === true && !isOwner) { await refuseBulk(message, text); return true; }
 
   const reason = String(intent.actions.find((a: any) => a?.reason)?.reason || 'No reason provided').substring(0, 400);
   const env: RunEnv = {
@@ -2675,7 +2805,7 @@ client.on('messageCreate', async (message) => {
   const autoChat = false; // the AI never jumps into conversations on its own
 
   if (!isCommand && (addressed || autoChat)) {
-    if (addressed && isAuthorized) { // every addressed staff message is read by the AI
+    if (addressed && (isAuthorized || message.author.id === message.guild.ownerId)) {
       if (!(await claimOnce(`staff_${message.id}`))) return;
       const handled = await handleStaffAiAction(message, {
         isStaff: (id: string, member: any) => allowedUserIds.includes(id) || !!member?.roles?.cache?.has(allowedRoleId),
@@ -2850,10 +2980,8 @@ client.on('messageCreate', async (message) => {
     return message.reply({ embeds: [embed] }).catch(() => {});
   }
 
-  // Commands requiring authorization
-  if (!isAuthorized) {
-    return message.reply('❌ You do not have permission to use staff commands.').catch(() => {});
-  }
+  // Staff-only commands: people without the role get no reply at all (stray "?" or unknown commands included)
+  if (!isAuthorized) return;
 
   if (command === 'createchannel') {
     const name = args.join('-');
