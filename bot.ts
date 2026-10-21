@@ -368,7 +368,11 @@ Rules:
       body: JSON.stringify({
         model: STAFF_AI_MODEL,
         temperature: 0,
-        messages: [{ role: 'system', content: system }, { role: 'user', content: `${hint}\nMessage: ${maskedText}` }]
+        max_tokens: 2048,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: `${hint}\nMessage: ${maskedText}` }
+        ]
       })
     });
     const data: any = await res.json();
