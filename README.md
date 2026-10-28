@@ -39,24 +39,12 @@ cp .env.example .env   # fill it in
 npm start
 ```
 
-## Server Manager (`?sm`)
-- `?sm on` / `?sm off` (**server owner only**) turns Server Manager on or off.
-- While it is on, staff (the staff role and the staff user IDs) can ask the bot for any server task in plain words, for example "rename #general to #lobby", "move the Gamers role above Members", "make a category Events and put #raids in it", "announce the update in #news".
-- Before anything runs, the bot checks every command: whether it has the Discord permission it needs, whether the owner-only rules allow it, and whether the details are complete. Impossible commands are reported and skipped. The rest run.
-- Regular members who ask the bot to change the server get a **DM warning** and nothing is changed.
-- Bulk requests such as "ban everyone" are still refused unless the owner asks.
-- Only the server owner can grant the Administrator permission.
+## Server Manager (owner only)
+- The server owner can give the bot any server task in plain words, for example "rename all channels beautifully", "rename #general to #lobby", "move the Gamers role above Members", "make a category Events and put #raids in it". The bot does it without arguing; it only reports what it can't do because of Discord permissions.
+- Only the owner gets commands. Anyone else who asks gets a refusal and nothing changes.
+- Bulk requests such as "ban everyone" are for the owner only, and run.
+- Up to 60 commands per owner message. For bigger jobs, ask again for the rest.
 - Reading: text/code files up to 3 MB (long files are condensed in parts), images up to 8 MB, videos up to 25 MB, PDFs up to 15 MB.
 - GIFs: post a GIF link, or ask for a GIF by description. Searching by description needs `TENOR_API_KEY` (free Tenor key) in the environment.
 
 **Security:** set `OPENROUTER_API_KEY` in the environment. The source no longer contains a fallback key. If an old copy of this repo was public, rotate that key on OpenRouter.
-
-### Auto mode (`?sm auto on|off`, owner only)
-- `?sm auto on` starts it. `?sm auto off` stops it. Nothing else to set.
-- While on, the AI works through the whole server in passes: it reads the server, reads its own recent log, and does what is needed. A pass runs **every minute**, or **every 5 seconds** while owner/staff requests are queued.
-- It does everything except **kick, ban and unban**: create, rename, move, delete channels, categories, roles; topics, slowmode, permissions; role colours and order; member mute/nickname/roles/voice; messages, announcements, invites, threads.
-- Owner and staff requests made while it is on are queued and carried out in full over the passes (e.g. "rename all channels beautifully").
-- Hard guards in code: no kick/ban/unban; never acts on the owner or the bot; never grants Administrator; the staff role is protected; the log channel can't be deleted.
-- Every change is logged to `?sm log #channel` (or the owner's DMs if no log channel is set). The AI reads back its recent log each pass so it doesn't undo its own work.
-- When the server is perfect and nothing is queued, it **turns itself off** and says so. A safety stop ends a run after 240 passes or after 3 passes in a row where nothing could be done.
-- Passes are in memory: a bot restart resumes from the saved on/off setting.
