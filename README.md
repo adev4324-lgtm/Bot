@@ -51,9 +51,12 @@ npm start
 
 **Security:** set `OPENROUTER_API_KEY` in the environment. The source no longer contains a fallback key. If an old copy of this repo was public, rotate that key on OpenRouter.
 
-### Auto mode (`?sm auto`)
-- `?sm on` first, then `?sm auto on [minutes]` (default 60, minimum 15). The AI reviews the server on that timer and makes small organising fixes on its own.
-- Allowed without anyone asking: create categories and channels, rename, move and reorder channels and categories, reorder roles, set topics, create roles, change role colours and names.
-- Never: delete anything, ban/kick/mute, touch members, change permissions, or edit powerful or staff roles.
-- At most 5 changes per pass. Every pass is logged to `?sm log #channel` (or sent to the owner's DMs if no log channel is set).
-- `?sm auto off` stops it. `?sm off` turns Server Manager off entirely.
+### Auto mode (`?sm auto on|off`, owner only)
+- `?sm auto on` starts it. `?sm auto off` stops it. Nothing else to set.
+- While on, the AI works through the whole server in passes: it reads the server, reads its own recent log, and does what is needed. A pass runs **every minute**, or **every 5 seconds** while owner/staff requests are queued.
+- It does everything except **kick, ban and unban**: create, rename, move, delete channels, categories, roles; topics, slowmode, permissions; role colours and order; member mute/nickname/roles/voice; messages, announcements, invites, threads.
+- Owner and staff requests made while it is on are queued and carried out in full over the passes (e.g. "rename all channels beautifully").
+- Hard guards in code: no kick/ban/unban; never acts on the owner or the bot; never grants Administrator; the staff role is protected; the log channel can't be deleted.
+- Every change is logged to `?sm log #channel` (or the owner's DMs if no log channel is set). The AI reads back its recent log each pass so it doesn't undo its own work.
+- When the server is perfect and nothing is queued, it **turns itself off** and says so. A safety stop ends a run after 240 passes or after 3 passes in a row where nothing could be done.
+- Passes are in memory: a bot restart resumes from the saved on/off setting.
