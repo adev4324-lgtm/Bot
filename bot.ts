@@ -310,6 +310,16 @@ async function refuseBulk(message: any, text: string) {
 
 interface StaffParse { intent?: any; error?: string }
 
+// Reads the AI's JSON even when it has small mistakes: smart quotes, unquoted keys, trailing commas, stray code fences.
+function parseLenientJson(raw: string): any {
+  try { return JSON.parse(raw); } catch (e) { /* repair below */ }
+  let t = raw.replace(/[\u201C\u201D]/g, '"').replace(/[\u2018\u2019]/g, "'");
+  t = t.replace(/```(?:json)?/gi, '');
+  t = t.replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:/g, '$1"$2":'); // unquoted keys
+  t = t.replace(/,\s*([}\]])/g, '$1');                               // trailing commas
+  return JSON.parse(t);
+}
+
 // The exact names on the server, so the AI can copy them (capped to keep the request small)
 function serverNamesHint(guild: any): string {
   const chans = [...guild.channels.cache.values()] as any[];
@@ -408,7 +418,7 @@ Rules:
     const raw: string = data?.choices?.[0]?.message?.content || '';
     const m = raw.match(/\{[\s\S]*\}/);
     if (!m) return { error: 'the AI returned no command' };
-    return { intent: JSON.parse(m[0]) };
+    return { intent: parseLenientJson(m[0]) };
   } catch (e: any) {
     return { error: String(e?.message || e).substring(0, 160) };
   }
