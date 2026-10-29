@@ -160,7 +160,7 @@ client.on('messageDelete', async (delMsg) => {
 // so the AI can never invent an ID.
 // ─────────────────────────────────────────────────────────────
 const MAIN_STAFF_ID = '1521870728079737053'; // pinged (with the server owner) when a bulk action is refused
-const STAFF_AI_MODEL = process.env.STAFF_AI_MODEL || 'poolside/laguna-s-2.1';
+const STAFF_AI_MODEL = process.env.STAFF_AI_MODEL || 'nvidia/nemotron-3.5-super-vl:free';
 const STAFF_ROLE_ID = '1555240171564302346';
 const DESTRUCTIVE = '(?:reset|unblock|delete|remove|ban|kick|purge|wipe|nuke|clear|mute|timeout|destroy|kill)';
 const BULK_A = new RegExp(`\\b${DESTRUCTIVE}\\b\\s+(?:\\S+\\s+){0,2}(?:(?:all|every|everyone|everybody|everything|each|entire|whole)\\b|@everyone|@here)`, 'i');
@@ -1696,7 +1696,7 @@ async function clearVerifyFails(guildId: string, userId: string): Promise<void> 
 
 // One OpenRouter call with the bot's usual model. Returns { error } if the call fails.
 async function orCall(kind: 'text' | 'vision', body: any, timeoutMs = 25000, primary?: string): Promise<any> {
-  const model = primary || (kind === 'vision' ? VISION_MODEL : 'poolside/laguna-s-2.1');
+  const model = primary || (kind === 'vision' ? VISION_MODEL : 'nvidia/nemotron-3.5-super-vl:free');
   try {
     const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
@@ -3061,7 +3061,7 @@ async function digestLongText(name: string, t: string): Promise<string> {
 }
 
 // ── READING ATTACHMENTS (images, videos, PDFs, text files) ──
-const VISION_MODEL = process.env.VISION_MODEL || 'google/gemini-2.5-flash';
+const VISION_MODEL = process.env.VISION_MODEL || 'nvidia/nemotron-3.5-super-vl:free';
 const IMAGE_MODEL = process.env.IMAGE_MODEL || 'google/gemini-2.5-flash-image';
 const TEXT_EXT = /\.(txt|md|csv|json|log|xml|ya?ml|ini|js|ts|py|java|c|cpp|h|cs|go|rs|html|css|sql|sh)$/i;
 
