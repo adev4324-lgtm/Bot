@@ -48,3 +48,12 @@ npm start
 - GIFs: post a GIF link, or ask for a GIF by description. Searching by description needs `TENOR_API_KEY` (free Tenor key) in the environment.
 
 **Security:** set `OPENROUTER_API_KEY` in the environment. The source no longer contains a fallback key. If an old copy of this repo was public, rotate that key on OpenRouter.
+
+## Welcome, NSFW scan, tickets (owner/staff)
+- `?welcome #channel` · `?welcome off` — where new members are welcomed.
+- `?wm set <text>` — welcome text. Placeholders: `{user}` `{name}` `{server}` `{count}`. `?wm` (no text) sends a preview to the welcome channel.
+- `?em <image link>` · `?em off` — image on the welcome embed.
+- `?nsfwscan on|off` — every image is checked. NSFW images are deleted. Severity 1 = warning, 2 = 1-day mute, 3 = ban. Each case is logged to `?modlog #channel` with the user, the image, the reason, the severity and the punishment. The bot's role must be above members for mute/ban to work.
+- `?ticketbuttons Label 1 | Label 2` (up to 5) · `?ticketrole @role` · `?ticketpanel #channel`. Clicking a button opens a private ticket channel that pings the user. The AI tries to solve it. If it can't, the ticket role is pinged. Anyone can close their own ticket with **Close ticket**.
+- AI commands: "create voice channel ...", "create forum channel ...", "give everyone the @X role" / "give role All Users to everyone".
+
